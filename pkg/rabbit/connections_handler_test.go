@@ -121,7 +121,7 @@ func Test_WatchConnectionsRabbitMQ(t *testing.T) {
 
 func ConfigTest(conn RabbitMQConnectionInterface, channel RabbitMQChannelInterface) error {
 	ChannelConfirm(conn, channel)
-	ChannelQoS(conn, channel)
+	ChannelQoS(1)(conn, channel)
 	return nil
 }
 
@@ -184,5 +184,52 @@ func TestAdapter_VhostHandler(t *testing.T) {
 				t.Errorf("Unexpected URI for %s/%s want:\n%+s\ngot:\n%+s", tt.broker, tt.vhost, tt.want, got)
 			}
 		})
+	}
+}
+
+type qosCapture struct {
+	RabbitMQChannelInterface
+	count, size int
+	global      bool
+	calls       int
+	err         error
+}
+
+func (q *qosCapture) Qos(count, size int, global bool) error {
+	q.count, q.size, q.global = count, size, global
+	q.calls++
+	return q.err
+}
+func TestChannelQoSWithPrefetchCount(t *testing.T) {
+	for _, count := range []int{1, 10, 240, 65535} {
+		q := &qosCapture{}
+		configure := ChannelQoSWithPrefetchCount(count)
+		// The connection handler invokes the same callback after reconnecting.
+		for i := 0; i < 2; i++ {
+			if err := configure(nil, q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if q.count != count || q.size != 0 || q.global || q.calls != 2 {
+			t.Errorf("unexpected QoS: %+v", q)
+		}
+	}
+	for _, count := range []int{0, -1, 65536} {
+		q := &qosCapture{}
+		if err := ChannelQoSWithPrefetchCount(count)(nil, q); err == nil || q.calls != 0 {
+			t.Errorf("invalid prefetch reached broker: %d", count)
+		}
+	}
+	expected := errors.New("channel closed")
+	if err := ChannelQoSWithPrefetchCount(10)(nil, &qosCapture{err: expected}); !errors.Is(err, expected) {
+		t.Errorf("lost QoS error: %v", err)
+	}
+}
+func TestChannelQoSRetainsDefault(t *testing.T) {
+	for _, tc := range []struct{ workers, want int }{{1, 100}, {10, 100}, {100, 100}, {240, 240}} {
+		q := &qosCapture{}
+		if err := ChannelQoS(tc.workers)(nil, q); err != nil || q.count != tc.want {
+			t.Errorf("workers=%d: QoS=%d, error=%v", tc.workers, q.count, err)
+		}
 	}
 }

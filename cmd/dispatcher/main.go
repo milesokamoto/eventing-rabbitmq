@@ -48,6 +48,7 @@ type envConfig struct {
 	DLXName           string `envconfig:"DLX_NAME" required:"false"`
 
 	// Number of concurrent messages in flight
+	PrefetchCount string        `envconfig:"PREFETCH_COUNT" required:"false"`
 	Parallelism   int           `envconfig:"PARALLELISM" default:"1" required:"false"`
 	Retry         int           `envconfig:"RETRY" required:"false"`
 	BackoffPolicy string        `envconfig:"BACKOFF_POLICY" required:"false"`
@@ -122,12 +123,18 @@ func main() {
 		logger.Fatalw("failed to set up dispatch metric", zap.Error(err))
 	}
 
+	prefetchCount, err := env.prefetchCount()
+	if err != nil {
+		logger.Fatalw("Invalid PREFETCH_COUNT", zap.Error(err))
+	}
+	logger.Infow("Configuring RabbitMQ consumer", "workers", env.Parallelism, "prefetchCount", prefetchCount)
+
 	rmqHelper := rabbit.NewRabbitMQConnectionHandler(5, 1000, logger)
 	rmqHelper.Setup(ctx, rabbit.VHostHandler(
 		env.RabbitURL,
 		env.RabbitMQVhost),
 		func(c rabbit.RabbitMQConnectionInterface, ch rabbit.RabbitMQChannelInterface) error {
-			if err := rabbit.ChannelQoS(c, ch); err != nil {
+			if err := rabbit.ChannelQoSWithPrefetchCount(prefetchCount)(c, ch); err != nil {
 				return err
 			}
 
@@ -148,4 +155,12 @@ func main() {
 			time.Sleep(time.Second)
 		}
 	}
+}
+
+// An omitted override retains the prefetch used by existing deployments.
+func (e envConfig) prefetchCount() (int, error) {
+	if e.PrefetchCount == "" {
+		return rabbit.PrefetchForWorkers(e.Parallelism), nil
+	}
+	return utils.ParsePrefetchCount(e.PrefetchCount)
 }

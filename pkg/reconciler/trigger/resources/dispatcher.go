@@ -19,6 +19,8 @@ package resources
 import (
 	"fmt"
 
+	"knative.dev/eventing-rabbitmq/pkg/utils"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -184,6 +186,12 @@ func MakeDispatcherDeployment(args *DispatcherArgs) *appsv1.Deployment {
 				Name:  "PARALLELISM",
 				Value: "1",
 			})
+	}
+	if prefetch, ok := args.Trigger.Annotations[utils.PrefetchCountAnnotation]; ok {
+		dispatcher.Env = append(dispatcher.Env, corev1.EnvVar{
+			Name:  "PREFETCH_COUNT",
+			Value: prefetch,
+		})
 	}
 	if args.RabbitMQVHost != "" {
 		dispatcher.Env = append(dispatcher.Env,
