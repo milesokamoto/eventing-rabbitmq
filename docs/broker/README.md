@@ -61,6 +61,30 @@ a time by the trigger but ordering won't be guaranteed as events are sent to the
 
 More details and samples of this can be found [here](../../samples/broker-trigger/trigger-customizations)
 
+### Trigger Prefetch Count
+
+Set `rabbitmq.eventing.knative.dev/prefetch-count` to limit the number of
+unacknowledged messages RabbitMQ delivers to each Trigger consumer. It accepts
+integers from `1` through `65535`; `0` is rejected because RabbitMQ treats it as
+unlimited. Removing the annotation restores `max(100, parallelism)`.
+
+Prefetch is independent of worker parallelism. A value below parallelism limits
+the number of workers that can receive a message. For large payloads, reduce both
+to bound message buffering and concurrent processing. The annotation also applies
+to the Trigger's dead-letter dispatcher, when one exists.
+
+```yaml
+metadata:
+  annotations:
+    rabbitmq.eventing.knative.dev/parallelism: "10"
+    rabbitmq.eventing.knative.dev/prefetch-count: "10"
+```
+
+The broker controller passes the annotation as `PREFETCH_COUNT`; the dispatcher
+checks it at startup and reapplies the same QoS after reconnecting. The controller,
+webhook and dispatcher must all support this setting. Existing annotations do not
+change RabbitmqSource consumers or the Broker's own dead-letter dispatcher.
+
 ## Delivery Failures and Delivery Spec
 A subset of HTTP status codes from a sink are considered a [retryable error](https://github.com/knative/specs/blob/main/specs/eventing/data-plane.md#event-acknowledgement-and-delivery-retry). When this occurs, delivery spec (available on Trigger and Broker) can specify how messages are retried and "dead-lettered". Reference
 [Configuring Broker event delivery](https://knative.dev/docs/eventing/event-delivery/#configuring-broker-event-delivery)

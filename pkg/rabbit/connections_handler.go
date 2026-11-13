@@ -248,8 +248,16 @@ func PrefetchForWorkers(workers int) int {
 
 // ChannelQoS returns a channel config function that sets the prefetch count sized for the given worker count.
 func ChannelQoS(workers int) func(RabbitMQConnectionInterface, RabbitMQChannelInterface) error {
+	return ChannelQoSWithPrefetchCount(PrefetchForWorkers(workers))
+}
+
+// ChannelQoSWithPrefetchCount sets a bounded per-consumer delivery limit.
+func ChannelQoSWithPrefetchCount(prefetchCount int) func(RabbitMQConnectionInterface, RabbitMQChannelInterface) error {
 	return func(connection RabbitMQConnectionInterface, channel RabbitMQChannelInterface) error {
-		return channel.Qos(PrefetchForWorkers(workers), 0, false)
+		if prefetchCount < 1 || prefetchCount > 65535 {
+			return fmt.Errorf("prefetch count must be between 1 and 65535, got %d", prefetchCount)
+		}
+		return channel.Qos(prefetchCount, 0, false)
 	}
 }
 
