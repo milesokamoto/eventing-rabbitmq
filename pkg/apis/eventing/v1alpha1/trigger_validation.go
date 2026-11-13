@@ -79,6 +79,16 @@ func (t *RabbitTrigger) Validate(ctx context.Context) *apis.FieldError {
 		}
 	}
 
+	if prefetch, ok := t.GetAnnotations()[utils.PrefetchCountAnnotation]; ok {
+		if _, err := utils.ParsePrefetchCount(prefetch); err != nil {
+			return &apis.FieldError{
+				Message: "Invalid prefetch-count annotation",
+				Paths:   []string{"metadata.annotations[" + utils.PrefetchCountAnnotation + "]"},
+				Details: err.Error(),
+			}
+		}
+	}
+
 	if apiErr := utils.ValidateResourceRequestsAndLimits(t.ObjectMeta); apiErr != nil {
 		return apiErr
 	}

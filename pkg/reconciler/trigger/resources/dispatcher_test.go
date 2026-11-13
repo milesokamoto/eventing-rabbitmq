@@ -156,6 +156,34 @@ func TestMakeDispatcherDeployment(t *testing.T) {
 	}
 }
 
+func TestDispatcherPrefetchCount(t *testing.T) {
+	for _, dlx := range []bool{false, true} {
+		args := dispatcherArgs(withParallelism("100"))
+		args.DLX = dlx
+		args.Trigger.Annotations["rabbitmq.eventing.knative.dev/prefetch-count"] = "10"
+		deployment := MakeDispatcherDeployment(args)
+		found := 0
+		for _, env := range deployment.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "PREFETCH_COUNT" {
+				found++
+				if env.Value != "10" {
+					t.Errorf("prefetch was changed: %q", env.Value)
+				}
+			}
+		}
+		if found != 1 {
+			t.Errorf("DLX=%v: got %d prefetch variables", dlx, found)
+		}
+		delete(args.Trigger.Annotations, "rabbitmq.eventing.knative.dev/prefetch-count")
+		deployment = MakeDispatcherDeployment(args)
+		for _, env := range deployment.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "PREFETCH_COUNT" {
+				t.Error("removing the annotation did not restore the default")
+			}
+		}
+	}
+}
+
 func deployment(opts ...func(*appsv1.Deployment)) *appsv1.Deployment {
 	trueValue := true
 	one := int32(1)

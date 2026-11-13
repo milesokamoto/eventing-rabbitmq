@@ -200,3 +200,27 @@ func validBroker(name string) *eventingv1.Broker {
 		},
 	}
 }
+
+func TestTriggerPrefetchCount(t *testing.T) {
+	for _, value := range []string{"1", "10", "65535", "", "0", "-1", "65536", "ten"} {
+		t.Run(value, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), client.Key{}, fake.NewSimpleClientset(validBroker("foo")))
+			configured := trigger(withBroker("foo"), withAnnotation(utils.PrefetchCountAnnotation, value))
+			err := configured.Validate(ctx)
+			_, parseErr := utils.ParsePrefetchCount(value)
+			if (err != nil) != (parseErr != nil) {
+				t.Fatalf("validation for %q: %v", value, err)
+			}
+		})
+	}
+	ctx := context.WithValue(context.Background(), client.Key{}, fake.NewSimpleClientset(validBroker("foo")))
+	original := trigger(withBroker("foo"), withAnnotation(utils.PrefetchCountAnnotation, "10"))
+	for _, changed := range []*v1.RabbitTrigger{
+		trigger(withBroker("foo"), withAnnotation(utils.PrefetchCountAnnotation, "20")),
+		trigger(withBroker("foo")),
+	} {
+		if err := changed.Validate(apis.WithinUpdate(ctx, original)); err != nil {
+			t.Fatalf("cannot update/remove prefetch: %v", err)
+		}
+	}
+}
