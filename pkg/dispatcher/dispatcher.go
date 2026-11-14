@@ -89,8 +89,7 @@ func (d *Dispatcher) ConsumeFromQueue(ctx context.Context, conn rabbit.RabbitMQC
 	}
 
 	topts := []cehttp.Option{cehttp.WithIsRetriableFunc(func(statusCode int) bool {
-		retry, _ := kncloudevents.SelectiveRetry(ctx, &http.Response{StatusCode: statusCode}, nil)
-		return retry
+		return d.isRetriableStatus(ctx, statusCode)
 	})}
 
 	if d.Timeout != 0 {
@@ -151,6 +150,15 @@ func (d *Dispatcher) ConsumeFromQueue(ctx context.Context, conn rabbit.RabbitMQC
 			workerQueue <- msg
 		}
 	}
+}
+
+func (d *Dispatcher) isRetriableStatus(ctx context.Context, statusCode int) bool {
+	if d.DLX {
+		// A dead-letter sink must accept the event before we remove it.
+		return statusCode < 200 || statusCode >= 300
+	}
+	retry, _ := kncloudevents.SelectiveRetry(ctx, &http.Response{StatusCode: statusCode}, nil)
+	return retry
 }
 
 func finishConsuming(wg *sync.WaitGroup, workerQueue chan amqp.Delivery) {
@@ -231,45 +239,13 @@ func (d *Dispatcher) dispatch(ctx context.Context, msg amqp.Delivery, ceClient c
 	statusCode, isSuccess := getStatus(ctx, result)
 
 	if !isSuccess {
-		logging.FromContext(ctx).Warnf("failed to deliver to %q", d.SubscriberURL)
-
-		// We need to ack the original message.
-		if err = msg.Ack(false); err != nil {
-			logging.FromContext(ctx).Warn("failed to Ack event: ", err)
-		}
-
-		// Add headers as described here: https://knative.dev/docs/eventing/event-delivery/#configuring-channel-event-delivery
-		event.SetExtension("knativeerrordest", d.SubscriberURL)
-		event.SetExtension("knativeerrorcode", statusCode)
-
-		// Queue the event into DLQ with the correct headers.
-		if err = sendToRabbitMQ(ctx, channel, dlqExchange, event); err != nil {
-			logging.FromContext(ctx).Warn("failed to send event: ", err)
-		}
-		return fmt.Errorf("failed to deliver to %q", d.SubscriberURL)
+		return forwardFailure(ctx, msg, channel, dlqExchange, event, d.SubscriberURL, statusCode)
 	} else if response != nil {
-		logging.FromContext(ctx).Infof("sending an event: %+v", response)
 		ctx = cloudevents.ContextWithTarget(ctx, d.BrokerIngressURL)
 		result = ceClient.Send(ctx, *response)
-		_, isSuccess = getStatus(ctx, result)
+		statusCode, isSuccess = getStatus(ctx, result)
 		if !isSuccess {
-			logging.FromContext(ctx).Warnf("failed to deliver to %q", d.BrokerIngressURL)
-
-			// We need to ack the original message.
-			if err = msg.Ack(false); err != nil {
-				logging.FromContext(ctx).Warn("failed to Ack event: ", err)
-			}
-
-			// Add headers as described here: https://knative.dev/docs/eventing/event-delivery/#configuring-channel-event-delivery
-			event.SetExtension("knativeerrordest", d.SubscriberURL)
-			event.SetExtension("knativeerrorcode", statusCode)
-			event.SetExtension("knativeerrordata", result)
-
-			// Queue the event into DLQ with the correct headers.
-			if err = sendToRabbitMQ(ctx, channel, dlqExchange, event); err != nil {
-				logging.FromContext(ctx).Warn("failed to send event: ", err)
-			}
-			return fmt.Errorf("failed to deliver to %q", d.BrokerIngressURL)
+			return forwardFailure(ctx, msg, channel, dlqExchange, event, d.BrokerIngressURL, statusCode)
 		}
 	}
 
@@ -279,7 +255,30 @@ func (d *Dispatcher) dispatch(ctx context.Context, msg amqp.Delivery, ceClient c
 	return nil
 }
 
-// Defaulting to Ack as this always hits the DLQ.
+// forwardFailure confirms the dead-letter publication before acknowledging the
+// original delivery. A failed publication leaves the original available to retry.
+func forwardFailure(ctx context.Context, msg amqp.Delivery, channel rabbit.RabbitMQChannelInterface, exchange string, event *cloudevents.Event, destination string, status int) error {
+	event.SetExtension("knativeerrordest", destination)
+	event.SetExtension("knativeerrorcode", status)
+	if err := sendToRabbitMQ(ctx, channel, exchange, event); err != nil {
+		logging.FromContext(ctx).Warnw("failed to publish dead-letter event", "event_id", event.ID(), "destination", destination, "error", err)
+		return requeueDelivery(ctx, msg, err)
+	}
+	if err := msg.Ack(false); err != nil {
+		return fmt.Errorf("acknowledge forwarded event: %w", err)
+	}
+	return fmt.Errorf("failed to deliver to %q (status %d); dead-letter handling complete", destination, status)
+}
+
+func requeueDelivery(ctx context.Context, msg amqp.Delivery, cause error) error {
+	if err := msg.Nack(false, true); err != nil {
+		logging.FromContext(ctx).Warnw("failed to requeue event", "delivery_tag", msg.DeliveryTag, "error", err)
+		return fmt.Errorf("%v; requeue delivery: %w", cause, err)
+	}
+	return cause
+}
+
+// Acknowledge a dead-letter event only after its sink and any response accept it.
 func (d *Dispatcher) dispatchDLQ(ctx context.Context, msg amqp.Delivery, ceClient cloudevents.Client) error {
 	start := time.Now()
 
@@ -320,38 +319,32 @@ func (d *Dispatcher) dispatchDLQ(ctx context.Context, msg amqp.Delivery, ceClien
 	}()
 
 	ctx = cloudevents.ContextWithTarget(ctx, d.SubscriberURL)
+	// Even a trigger with no subscriber retries needs bounded sink retries before
+	// requeueing. This prevents a failing sink from creating a tight redelivery loop.
+	retries, delay := max(d.MaxRetries, 3), max(d.BackoffDelay, 2*time.Second)
 	if d.BackoffPolicy == eventingduckv1.BackoffPolicyLinear {
-		ctx = cloudevents.ContextWithRetriesLinearBackoff(ctx, d.BackoffDelay, d.MaxRetries)
+		ctx = cloudevents.ContextWithRetriesLinearBackoff(ctx, delay, retries)
 	} else {
-		ctx = cloudevents.ContextWithRetriesExponentialBackoff(ctx, d.BackoffDelay, d.MaxRetries)
+		ctx = cloudevents.ContextWithRetriesExponentialBackoff(ctx, delay, retries)
 	}
 
 	response, result := ceClient.Request(ctx, *event)
-	_, isSuccess := getStatus(ctx, result)
-
-	if !isSuccess {
-		logging.FromContext(ctx).Warnf("failed to deliver to %q %s", d.SubscriberURL, msg)
-		if err = msg.Ack(false); err != nil {
-			logging.FromContext(ctx).Warn("failed to Ack event: ", err)
-		}
-		return fmt.Errorf("failed to deliver to %q", d.SubscriberURL)
+	statusCode, _ := getStatus(ctx, result)
+	if statusCode < 200 || statusCode >= 300 {
+		logging.FromContext(ctx).Warnw("dead-letter sink did not accept event", "destination", d.SubscriberURL, "event_id", event.ID(), "status", statusCode)
+		return requeueDelivery(ctx, msg, fmt.Errorf("failed to deliver to %q (status %d)", d.SubscriberURL, statusCode))
 	} else if response != nil {
-		logging.FromContext(ctx).Infof("Sending an event: %+v", response)
 		ctx = cloudevents.ContextWithTarget(ctx, d.BrokerIngressURL)
 		result = ceClient.Send(ctx, *response)
-		_, isSuccess = getStatus(ctx, result)
-		if !isSuccess {
-			logging.FromContext(ctx).Warnf("failed to deliver to %q", d.BrokerIngressURL)
-			if err = msg.Ack(false); err != nil {
-				logging.FromContext(ctx).Warn("failed to Ack event: ", err)
-			}
-			return fmt.Errorf("failed to deliver to %q", d.BrokerIngressURL)
+		statusCode, _ = getStatus(ctx, result)
+		if statusCode < 200 || statusCode >= 300 {
+			logging.FromContext(ctx).Warnw("broker did not accept dead-letter response", "destination", d.BrokerIngressURL, "event_id", event.ID(), "status", statusCode)
+			return requeueDelivery(ctx, msg, fmt.Errorf("failed to deliver response to %q (status %d)", d.BrokerIngressURL, statusCode))
 		}
 	}
 
-	err = msg.Ack(false)
-	if err != nil {
-		logging.FromContext(ctx).Warn("failed to Ack event: ", err)
+	if err = msg.Ack(false); err != nil {
+		return fmt.Errorf("acknowledge dead-letter event: %w", err)
 	}
 	return nil
 }
